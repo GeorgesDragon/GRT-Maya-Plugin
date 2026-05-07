@@ -602,9 +602,94 @@ def exec_auto_grp(nodes):
         cmds.undoInfo(closeChunk=True)
 
 
-# =========================
-# Core Operation: Batch Attribute Tool
-# =========================
+def _mirror_axis_matrix(axis):
+    axis = axis.upper()
+    if axis == "X":
+        return om.MMatrix([
+            -1.0, 0.0, 0.0, 0.0,
+             0.0, 1.0, 0.0, 0.0,
+             0.0, 0.0, 1.0, 0.0,
+             0.0, 0.0, 0.0, 1.0
+        ])
+    if axis == "Y":
+        return om.MMatrix([
+             1.0, 0.0, 0.0, 0.0,
+             0.0,-1.0, 0.0, 0.0,
+             0.0, 0.0, 1.0, 0.0,
+             0.0, 0.0, 0.0, 1.0
+        ])
+    if axis == "Z":
+        return om.MMatrix([
+             1.0, 0.0, 0.0, 0.0,
+             0.0, 1.0, 0.0, 0.0,
+             0.0, 0.0,-1.0, 0.0,
+             0.0, 0.0, 0.0, 1.0
+        ])
+    raise ValueError(f"Unsupported mirror axis: {axis}")
+
+
+def _parse_mirror_flags(args):
+    syntax = om.MSyntax()
+    syntax.addFlag("-a", "-axis", om.MSyntax.kString)
+    _add_common_syntax_flags(syntax)
+
+    try:
+        arg_data = om.MArgParser(syntax, args)
+    except RuntimeError:
+        return None, False, False
+
+    axis = "X"
+    if arg_data.isFlagSet("-a"):
+        axis = arg_data.flagArgumentString("-a", 0).upper()
+        if axis not in ("X", "Y", "Z"):
+            om.MGlobal.displayError("GRT_mirrorSelection: Axis must be X, Y or Z.")
+            return None, False, False
+
+    hierarchy = arg_data.isFlagSet("-h")
+    rig_safe = arg_data.isFlagSet("-r")
+    return axis, hierarchy, rig_safe
+
+
+def exec_mirror_selection(nodes, axis="X", hierarchy=True, rig_safe=False):
+    if not nodes:
+        om.MGlobal.displayError("GRT_mirrorSelection: No valid transform selected.")
+        return
+
+    axis = axis.upper() if isinstance(axis, str) else "X"
+    if axis not in ("X", "Y", "Z"):
+        om.MGlobal.displayError("GRT_mirrorSelection: Axis must be X, Y or Z.")
+        return
+
+    targets = _collect_targets(nodes, hierarchy=hierarchy, rig_safe=rig_safe, require_opm=False)
+    if not targets:
+        om.MGlobal.displayError("GRT_mirrorSelection: No valid transform nodes found in selection.")
+        return
+
+    mirror = _mirror_axis_matrix(axis)
+    world_matrices = {}
+    for node in targets:
+        try:
+            world_matrices[node] = _get_world_matrix(node)
+        except RuntimeError:
+            om.MGlobal.displayWarning(f"GRT_mirrorSelection: Failed to read world matrix for {node}, skipping.")
+
+    cmds.undoInfo(openChunk=True, chunkName="GRT_mirrorSelection")
+    try:
+        for node in sorted(targets, key=_dag_depth):
+            if node not in world_matrices:
+                continue
+
+            mirrored = mirror * world_matrices[node] * mirror
+            locked = _unlock_trs(node)
+            try:
+                cmds.xform(node, matrix=list(mirrored), worldSpace=True)
+            except RuntimeError:
+                om.MGlobal.displayWarning(f"GRT_mirrorSelection: Failed to apply mirrored transform to {node}.")
+            finally:
+                _relock(locked)
+    finally:
+        cmds.undoInfo(closeChunk=True)
+
 
 def exec_batch_add_attr(nodes, preset_name, use_proxy=False):
     if not nodes:
@@ -911,6 +996,27 @@ class GRTAutoGRPCommand(om.MPxCommand):
         exec_auto_grp(sel)
 
 
+class GRTMirrorSelectionCommand(om.MPxCommand):
+    kCmdName = "GRT_mirrorSelection"
+
+    @staticmethod
+    def creator():
+        return GRTMirrorSelectionCommand()
+
+    @staticmethod
+    def syntaxCreator():
+        syntax = om.MSyntax()
+        syntax.addFlag("-a", "-axis", om.MSyntax.kString)
+        return _add_common_syntax_flags(syntax)
+
+    def doIt(self, args):
+        axis, hierarchy, rig_safe = _parse_mirror_flags(args)
+        if axis is None:
+            return
+        sel = cmds.ls(sl=True, long=True) or []
+        exec_mirror_selection(sel, axis=axis, hierarchy=hierarchy, rig_safe=rig_safe)
+
+
 class GRT_SetDisplayOverrideCmd(om.MPxCommand):
     kCmdName = "GRT_setDisplayOverride"
 
@@ -1139,6 +1245,15 @@ def _ui_call_transfer_proxys():
     exec_transfer_proxys(sel)
 
 
+def _ui_call_mirror_selection(axis, use_hierarchy, rig_safe):
+    args = ["-a", axis]
+    if use_hierarchy:
+        args += ["-h"]
+    if rig_safe:
+        args += ["-r"]
+    cmds.evalDeferred(lambda: cmds.GRT_mirrorSelection(*args))
+
+
 def _ui_call_reset_display_override():
     sel = cmds.ls(sl=True, long=True) or []
     if not sel:
@@ -1175,6 +1290,12 @@ def create_grt_menu():
         label="Auto Group",
         annotation="Creates two groups above the selected object: <name>_0_GRP and <name>_SDK_GRP, matching the object's world transform.",
         command=lambda *_: cmds.GRT_autoGRP()
+    )
+
+    cmds.menuItem(
+        label="Mirror Selection",
+        annotation="Mirror selected controls and groups across a world axis, preserving world position/orientation and hierarchy.",
+        command=lambda *_: create_grt_mirror_window()
     )
 
     cmds.menuItem(
@@ -1315,6 +1436,63 @@ def create_grt_batch_attr_window():
     cmds.showWindow(win)
 
 
+def create_grt_mirror_window():
+    if cmds.window("GRT_Mirror_Window", exists=True):
+        cmds.deleteUI("GRT_Mirror_Window")
+
+    win = cmds.window(
+        "GRT_Mirror_Window",
+        title="GRT Mirror Selection",
+        sizeable=True,
+        widthHeight=(320, 240)
+    )
+
+    cmds.columnLayout(adj=True, rowSpacing=6, columnAlign="center")
+
+    hierarchy_cb = cmds.checkBox(
+        label="Apply to Hierarchy",
+        value=True,
+        annotation="Mirror selected objects and their children."
+    )
+
+    rigsafe_cb = cmds.checkBox(
+        label="Rig-Safe Mode",
+        value=True,
+        annotation="Skip nodes that are constrained, locked, or non-keyable on TRS channels."
+    )
+
+    cmds.text(label="Mirror Axis:", align="left")
+    axis_col = cmds.radioCollection()
+    cmds.rowLayout(numberOfColumns=3, adjustableColumn=1)
+    cmds.radioButton(label="World X", select=True)
+    cmds.radioButton(label="World Y")
+    cmds.radioButton(label="World Z")
+    cmds.setParent("..")
+
+    def _selected_axis():
+        selected = cmds.radioCollection(axis_col, q=True, select=True)
+        if not selected:
+            return "X"
+        label = cmds.radioButton(selected, q=True, label=True)
+        return label.split()[-1]
+
+    def _flags():
+        use_h = cmds.checkBox(hierarchy_cb, q=True, value=True)
+        use_r = cmds.checkBox(rigsafe_cb, q=True, value=True)
+        return use_h, use_r
+
+    cmds.separator(height=8, style="in")
+
+    cmds.button(
+        label="Mirror Selection",
+        height=32,
+        annotation="Mirror selected transforms across the chosen world axis.",
+        command=lambda *_: _ui_call_mirror_selection(_selected_axis(), *_flags())
+    )
+
+    cmds.showWindow(win)
+
+
 def GRT_showDisplayOverrideUI():
     win = "GRT_displayOverrideWin"
     if cmds.window(win, exists=True):
@@ -1378,6 +1556,7 @@ def initializePlugin(mobject):
         mplugin.registerCommand(GRTPullOPMCommand.kCmdName, GRTPullOPMCommand.creator, GRTPullOPMCommand.syntaxCreator)
         mplugin.registerCommand(GRTZeroTRSCommand.kCmdName, GRTZeroTRSCommand.creator, GRTZeroTRSCommand.syntaxCreator)
         mplugin.registerCommand(GRTAutoGRPCommand.kCmdName, GRTAutoGRPCommand.creator, GRTAutoGRPCommand.syntaxCreator)
+        mplugin.registerCommand(GRTMirrorSelectionCommand.kCmdName, GRTMirrorSelectionCommand.creator, GRTMirrorSelectionCommand.syntaxCreator)
         mplugin.registerCommand(GRT_SetDisplayOverrideCmd.kCmdName, lambda: GRT_SetDisplayOverrideCmd(), GRT_SetDisplayOverrideCmd.create_syntax)
         mplugin.registerCommand(MatchAndRenameCommand.kCmdName, lambda: MatchAndRenameCommand())
 
@@ -1396,6 +1575,7 @@ def uninitializePlugin(mobject):
         mplugin.deregisterCommand(GRTPullOPMCommand.kCmdName)
         mplugin.deregisterCommand(GRTZeroTRSCommand.kCmdName)
         mplugin.deregisterCommand(GRTAutoGRPCommand.kCmdName)
+        mplugin.deregisterCommand(GRTMirrorSelectionCommand.kCmdName)
         mplugin.deregisterCommand(GRT_SetDisplayOverrideCmd.kCmdName)
         mplugin.deregisterCommand(MatchAndRenameCommand.kCmdName)
 
